@@ -71,6 +71,16 @@ static Command CreateOlapCommand()
     });
     olap.Subcommands.Add(initOlap);
 
+    // permits olap etl run
+    var etl = new Command("etl", "ETL commands");
+    var etlRun = new Command("run", "Load new OLTP activity into the warehouse (idempotent)");
+    etlRun.SetAction(async (parseResult, cancellationToken) =>
+    {
+        await EtlRunner.RunAsync(GetSqlPassword());
+    });
+    etl.Subcommands.Add(etlRun);
+    olap.Subcommands.Add(etl);
+
     return olap;
 }
 

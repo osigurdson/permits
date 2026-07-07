@@ -11,11 +11,19 @@ CREATE TABLE dim_permit_state (
 );
 GO
 
+-- Populated by the ETL from the distinct types seen in the OLTP data.
+CREATE TABLE dim_permit_type (
+    permit_type_key INT IDENTITY(1,1) PRIMARY KEY,
+    name NVARCHAR(100) NOT NULL UNIQUE
+);
+GO
+
 -- Grain: one row per permit state transition
 CREATE TABLE fact_permit_transition (
     permit_activity_id INT PRIMARY KEY,
     permit_id INT NOT NULL,
-    permit_type NVARCHAR(100) NOT NULL,
+    permit_type_key INT NOT NULL
+        CONSTRAINT fk_fact_transition_type REFERENCES dim_permit_type (permit_type_key),
     from_state_key INT NOT NULL
         CONSTRAINT fk_fact_transition_from REFERENCES dim_permit_state (state_key),
     to_state_key INT NOT NULL
@@ -24,6 +32,21 @@ CREATE TABLE fact_permit_transition (
         CONSTRAINT fk_fact_transition_date REFERENCES dim_date (date_key),
     transition_time DATETIME2 NOT NULL,
     from_state_entered_time DATETIME2 NULL  -- NULL on the apply row
+);
+GO
+
+-- Periodic snapshot. Grain: one row per permit per completed month, holding
+-- the permit's state as of month end. Only non-terminal states are kept
+-- (Rejected/Completed/ExpiredTerminal permits would otherwise accumulate a
+-- row every month forever), so "active permits in month M" is a plain count.
+CREATE TABLE fact_permit_state (
+    month_key INT NOT NULL,
+    permit_id INT NOT NULL,
+    permit_type_key INT NOT NULL
+        CONSTRAINT fk_fact_state_type REFERENCES dim_permit_type (permit_type_key),
+    state_key INT NOT NULL
+        CONSTRAINT fk_fact_state_state REFERENCES dim_permit_state (state_key),
+    CONSTRAINT pk_fact_permit_state PRIMARY KEY (month_key, permit_id)
 );
 GO
 
