@@ -20,9 +20,13 @@ static class ReportRunner
             case "permits-issued-report":
                 await PermitsIssuedAsync(password, fromMonth, toMonth, csv);
                 break;
+            case "active-vs-expired":
+                await ActiveVsExpiredAsync(password, fromMonth, toMonth, csv);
+                break;
             default:
                 throw new InvalidOperationException(
-                    $"Unknown report '{name}'. Available: permits-issued-report.");
+                    $"Unknown report '{name}'. Available: " +
+                    "permits-issued-report, active-vs-expired.");
         }
     }
 
@@ -61,6 +65,56 @@ static class ReportRunner
             ]);
         }
         Write(["month", "permit_type", "permits_issued"], rightAlign: [false, false, true], rows, csv);
+    }
+
+    // Active is a month-end census from the snapshot table; expired counts
+    // expiry events (transitions into Expired) during the month, per README.
+    private static async Task ActiveVsExpiredAsync(
+            string password, int fromMonth, int toMonth, bool csv)
+    {
+        using var conn = new SqlConnection(DbInit.GetConnStr(DbInit.OlapDbName, password));
+        await conn.OpenAsync();
+
+        using var cmd = conn.CreateCommand();
+        cmd.CommandText = """
+            WITH active AS (
+                SELECT f.month_key, COUNT(*) AS n
+                FROM fact_permit_state f
+                JOIN dim_permit_state s ON s.state_key = f.state_key
+                WHERE s.name = 'Active' AND f.month_key BETWEEN @from AND @to
+                GROUP BY f.month_key
+            ),
+            expired AS (
+                SELECT d.month_key, COUNT(*) AS n
+                FROM fact_permit_transition f
+                JOIN dim_permit_state s ON s.state_key = f.to_state_key
+                JOIN dim_date d ON d.date_key = f.date_key
+                WHERE s.name = 'Expired' AND d.month_key BETWEEN @from AND @to
+                GROUP BY d.month_key
+            )
+            SELECT COALESCE(a.month_key, e.month_key) AS month_key,
+                   COALESCE(a.n, 0) AS active_permits,
+                   COALESCE(e.n, 0) AS expired_permits
+            FROM active a
+            FULL OUTER JOIN expired e ON e.month_key = a.month_key
+            ORDER BY month_key
+            """;
+        cmd.Parameters.AddWithValue("@from", fromMonth);
+        cmd.Parameters.AddWithValue("@to", toMonth);
+
+        var rows = new List<string[]>();
+        using var reader = await cmd.ExecuteReaderAsync();
+        while (await reader.ReadAsync())
+        {
+            int monthKey = reader.GetInt32(0);
+            rows.Add([
+                $"{monthKey / 100:D4}-{monthKey % 100:D2}",
+                reader.GetInt32(1).ToString(),
+                reader.GetInt32(2).ToString(),
+            ]);
+        }
+        Write(["month", "active_permits", "expired_permits"],
+            rightAlign: [false, true, true], rows, csv);
     }
 
     private static void Write(string[] headers, bool[] rightAlign, List<string[]> rows, bool csv)
