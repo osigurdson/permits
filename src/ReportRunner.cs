@@ -16,6 +16,7 @@ static class ReportRunner
         ("active-vs-expired", "Active permits at month end vs permits expired during the month"),
         ("approvals-renewals-suspensions", "Monthly counts of approval, renewal and suspension transitions"),
         ("state-durations", "Time spent in each state (avg/stddev/median/p90 days) by entry month"),
+        ("payments-collected", "Total settled payments by permit type"),
     ];
 
     public static void List()
@@ -42,6 +43,9 @@ static class ReportRunner
                 break;
             case "state-durations":
                 await StateDurationsAsync(password, fromMonth, toMonth, csv);
+                break;
+            case "payments-collected":
+                await PaymentsCollectedAsync(password, fromMonth, toMonth, csv);
                 break;
             default:
                 throw new InvalidOperationException(
@@ -241,6 +245,40 @@ static class ReportRunner
         }
         Write(["month", "state", "count", "avg_days", "stddev_days", "median_days", "p90_days"],
             rightAlign: [false, false, true, true, true, true, true], rows, csv);
+    }
+
+    // Collected = settled only; the month range applies to the payment date.
+    private static async Task PaymentsCollectedAsync(
+            string password, int fromMonth, int toMonth, bool csv)
+    {
+        using var conn = new SqlConnection(DbInit.GetConnStr(DbInit.OlapDbName, password));
+        await conn.OpenAsync();
+
+        using var cmd = conn.CreateCommand();
+        cmd.CommandText = """
+            SELECT t.name, COUNT(*) AS payments, SUM(f.amount) AS total_collected
+            FROM fact_payment f
+            JOIN dim_permit_type t ON t.permit_type_key = f.permit_type_key
+            JOIN dim_date d ON d.date_key = f.date_key
+            WHERE f.status = 'SETTLED' AND d.month_key BETWEEN @from AND @to
+            GROUP BY t.name
+            ORDER BY t.name
+            """;
+        cmd.Parameters.AddWithValue("@from", fromMonth);
+        cmd.Parameters.AddWithValue("@to", toMonth);
+
+        var rows = new List<string[]>();
+        using var reader = await cmd.ExecuteReaderAsync();
+        while (await reader.ReadAsync())
+        {
+            rows.Add([
+                reader.GetString(0),
+                reader.GetInt32(1).ToString(),
+                reader.GetDecimal(2).ToString("F2"),
+            ]);
+        }
+        Write(["permit_type", "payments", "total_collected"],
+            rightAlign: [false, true, true], rows, csv);
     }
 
     // Linear interpolation between the two nearest ranks (PERCENTILE_CONT).

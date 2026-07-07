@@ -50,6 +50,22 @@ CREATE TABLE fact_permit_state (
 );
 GO
 
+-- Grain: one row per OLTP permit_payment row. Payments are mutable in OLTP
+-- (status changes when a pending payment settles or fails), so the ETL
+-- inserts new payments by id watermark and then refreshes changed statuses.
+-- date_key is the payment date; OLTP does not record when a status changed.
+CREATE TABLE fact_payment (
+    payment_id INT PRIMARY KEY,
+    permit_id INT NOT NULL,
+    permit_type_key INT NOT NULL
+        CONSTRAINT fk_fact_payment_type REFERENCES dim_permit_type (permit_type_key),
+    date_key INT NOT NULL
+        CONSTRAINT fk_fact_payment_date REFERENCES dim_date (date_key),
+    status NVARCHAR(20) NOT NULL,
+    amount DECIMAL(19, 4) NOT NULL
+);
+GO
+
 -- States are fixed by the permit state machine (PermitStateMachine.cs).
 INSERT INTO dim_permit_state (name) VALUES
     ('Initial'), ('Pending'), ('Rejected'), ('Active'),

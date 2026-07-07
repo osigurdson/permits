@@ -19,6 +19,10 @@ static class EtlRunner
 
     private sealed record Transition(int PermitId, int TypeKey, int StateKey, DateTime Time);
 
+    private sealed record NewPayment(
+        int PaymentId, int PermitId, string PermitType, DateTime Date,
+        string Status, decimal Amount);
+
     public static async Task RunAsync(string password)
     {
         using var oltp = new SqlConnection(DbInit.GetConnStr(DbInit.OltpDbName, password));
@@ -33,9 +37,16 @@ static class EtlRunner
             "SELECT COALESCE(MAX(permit_activity_id), 0) FROM fact_permit_transition");
         var activities = await ReadNewActivitiesAsync(oltp, watermark);
 
-        await ExtendDimDateAsync(dw, tx, activities);
-        var typeKeys = await LoadTypeKeysAsync(dw, tx, activities);
+        int paymentWatermark = await ScalarIntAsync(dw, tx,
+            "SELECT COALESCE(MAX(payment_id), 0) FROM fact_payment");
+        var payments = await ReadNewPaymentsAsync(oltp, paymentWatermark);
+
+        await ExtendDimDateAsync(dw, tx, activities, payments);
+        var typeKeys = await LoadTypeKeysAsync(dw, tx,
+            activities.Select(a => a.PermitType).Concat(payments.Select(p => p.PermitType)));
         int loaded = await LoadTransitionsAsync(dw, tx, stateKeys, typeKeys, activities);
+        int paymentsLoaded = await LoadPaymentsAsync(dw, tx, typeKeys, payments);
+        int refreshed = await RefreshPaymentStatusesAsync(oltp, dw, tx);
         int snapshotted = await SnapshotCompletedMonthsAsync(dw, tx, stateKeys);
 
         await tx.CommitAsync();
@@ -44,7 +55,8 @@ static class EtlRunner
             "SELECT COUNT(*) FROM fact_permit_transition");
         Console.WriteLine(
             $"Loaded {loaded} new transitions ({total} total), " +
-            $"{snapshotted} new state snapshots.");
+            $"{snapshotted} new state snapshots, " +
+            $"{paymentsLoaded} new payments ({refreshed} payment status updates).");
     }
 
     // The state a permit is in after an activity; the state it left is simply
@@ -88,11 +100,39 @@ static class EtlRunner
         return result;
     }
 
+    private static async Task<List<NewPayment>> ReadNewPaymentsAsync(
+            SqlConnection oltp, int watermark)
+    {
+        using var cmd = oltp.CreateCommand();
+        cmd.CommandText = """
+            SELECT pp.payment_id, pp.permit_id, p.permit_type,
+                   pp.payment_date, pp.status, pp.amount
+            FROM permit_payment pp
+            JOIN permit p ON p.permit_id = pp.permit_id
+            WHERE pp.payment_id > @watermark
+            ORDER BY pp.payment_id
+            """;
+        cmd.Parameters.AddWithValue("@watermark", watermark);
+
+        var result = new List<NewPayment>();
+        using var reader = await cmd.ExecuteReaderAsync();
+        while (await reader.ReadAsync())
+        {
+            result.Add(new NewPayment(
+                reader.GetInt32(0), reader.GetInt32(1), reader.GetString(2),
+                reader.GetDateTime(3), reader.GetString(4), reader.GetDecimal(5)));
+        }
+        return result;
+    }
+
     // Adds every day of the new batch's date range that dim_date is missing.
     private static async Task ExtendDimDateAsync(
-            SqlConnection dw, SqlTransaction tx, List<NewActivity> activities)
+            SqlConnection dw, SqlTransaction tx,
+            List<NewActivity> activities, List<NewPayment> payments)
     {
-        if (activities.Count == 0)
+        var dates = activities.Select(a => a.Time.Date)
+            .Concat(payments.Select(p => p.Date.Date)).ToList();
+        if (dates.Count == 0)
         {
             return;
         }
@@ -117,8 +157,8 @@ static class EtlRunner
         var dateParam = insert.Parameters.Add("@date", System.Data.SqlDbType.Date);
         var monthParam = insert.Parameters.Add("@month", System.Data.SqlDbType.Int);
 
-        var first = activities[0].Time.Date;
-        var last = activities[^1].Time.Date;
+        var first = dates.Min();
+        var last = dates.Max();
         for (var day = first; day <= last; day = day.AddDays(1))
         {
             if (existing.Contains(DateKey(day)))
@@ -133,7 +173,7 @@ static class EtlRunner
     }
 
     private static async Task<Dictionary<string, int>> LoadTypeKeysAsync(
-            SqlConnection dw, SqlTransaction tx, List<NewActivity> activities)
+            SqlConnection dw, SqlTransaction tx, IEnumerable<string> permitTypes)
     {
         var keys = new Dictionary<string, int>();
         using (var read = dw.CreateCommand())
@@ -147,7 +187,7 @@ static class EtlRunner
             }
         }
 
-        foreach (var type in activities.Select(a => a.PermitType).Distinct())
+        foreach (var type in permitTypes.Distinct())
         {
             if (keys.ContainsKey(type))
             {
@@ -253,6 +293,86 @@ static class EtlRunner
             return (reader.GetInt32(0), reader.GetDateTime(1));
         }
         return (stateKeys[PermitState.Initial], null);
+    }
+
+    private static async Task<int> LoadPaymentsAsync(
+            SqlConnection dw,
+            SqlTransaction tx,
+            Dictionary<string, int> typeKeys,
+            List<NewPayment> payments)
+    {
+        using var insert = dw.CreateCommand();
+        insert.Transaction = tx;
+        insert.CommandText = """
+            INSERT INTO fact_payment
+                (payment_id, permit_id, permit_type_key, date_key, status, amount)
+            VALUES (@id, @permit, @type, @date, @status, @amount)
+            """;
+        var p = insert.Parameters;
+        p.Add("@id", System.Data.SqlDbType.Int);
+        p.Add("@permit", System.Data.SqlDbType.Int);
+        p.Add("@type", System.Data.SqlDbType.Int);
+        p.Add("@date", System.Data.SqlDbType.Int);
+        p.Add("@status", System.Data.SqlDbType.NVarChar, 20);
+        p.Add("@amount", System.Data.SqlDbType.Decimal);
+
+        foreach (var payment in payments)
+        {
+            p["@id"].Value = payment.PaymentId;
+            p["@permit"].Value = payment.PermitId;
+            p["@type"].Value = typeKeys[payment.PermitType];
+            p["@date"].Value = DateKey(payment.Date);
+            p["@status"].Value = payment.Status;
+            p["@amount"].Value = payment.Amount;
+            await insert.ExecuteNonQueryAsync();
+        }
+        return payments.Count;
+    }
+
+    // Payments already in the warehouse can still change status in OLTP
+    // (a pending payment later settles or fails), so re-check them. Only
+    // PENDING rows can move; settled/failed/refunded are final.
+    private static async Task<int> RefreshPaymentStatusesAsync(
+            SqlConnection oltp, SqlConnection dw, SqlTransaction tx)
+    {
+        var pending = new List<int>();
+        using (var read = dw.CreateCommand())
+        {
+            read.Transaction = tx;
+            read.CommandText = "SELECT payment_id FROM fact_payment WHERE status = 'PENDING'";
+            using var reader = await read.ExecuteReaderAsync();
+            while (await reader.ReadAsync())
+            {
+                pending.Add(reader.GetInt32(0));
+            }
+        }
+
+        using var lookup = oltp.CreateCommand();
+        lookup.CommandText = "SELECT status FROM permit_payment WHERE payment_id = @id";
+        var lookupId = lookup.Parameters.Add("@id", System.Data.SqlDbType.Int);
+
+        using var update = dw.CreateCommand();
+        update.Transaction = tx;
+        update.CommandText =
+            "UPDATE fact_payment SET status = @status WHERE payment_id = @id";
+        var updateStatus = update.Parameters.Add("@status", System.Data.SqlDbType.NVarChar, 20);
+        var updateId = update.Parameters.Add("@id", System.Data.SqlDbType.Int);
+
+        int refreshed = 0;
+        foreach (var paymentId in pending)
+        {
+            lookupId.Value = paymentId;
+            var status = (string)(await lookup.ExecuteScalarAsync())!;
+            if (status == "PENDING")
+            {
+                continue;
+            }
+            updateStatus.Value = status;
+            updateId.Value = paymentId;
+            await update.ExecuteNonQueryAsync();
+            refreshed++;
+        }
+        return refreshed;
     }
 
     // Walks all transitions in time order, tracking each permit's current
