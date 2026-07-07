@@ -81,6 +81,42 @@ static Command CreateOlapCommand()
     etl.Subcommands.Add(etlRun);
     olap.Subcommands.Add(etl);
 
+    // permits olap report --name permits-issued-report --from 2025-01 --to 2025-12
+    var nameOpt = new Option<string>("--name")
+    {
+        Required = true,
+        Description = "Report name (permits-issued-report)",
+    };
+    var fromOpt = new Option<string>("--from")
+    {
+        Required = true,
+        Description = "First month, inclusive (yyyy-MM)",
+    };
+    var toOpt = new Option<string>("--to")
+    {
+        Required = true,
+        Description = "Last month, inclusive (yyyy-MM)",
+    };
+    var csvOpt = new Option<bool>("--csv")
+    {
+        Description = "Output CSV instead of a table",
+    };
+    var report = new Command("report", "Output a report for the month range");
+    report.Options.Add(nameOpt);
+    report.Options.Add(fromOpt);
+    report.Options.Add(toOpt);
+    report.Options.Add(csvOpt);
+    report.SetAction(async (parseResult, cancellationToken) =>
+    {
+        await ReportRunner.RunAsync(
+            GetSqlPassword(),
+            parseResult.GetValue(nameOpt)!,
+            parseResult.GetValue(fromOpt)!,
+            parseResult.GetValue(toOpt)!,
+            parseResult.GetValue(csvOpt));
+    });
+    olap.Subcommands.Add(report);
+
     return olap;
 }
 
