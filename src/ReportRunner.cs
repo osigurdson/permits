@@ -15,6 +15,7 @@ static class ReportRunner
         ("permits-issued-report", "Permits issued (Pending -> Active) by type and month"),
         ("active-vs-expired", "Active permits at month end vs permits expired during the month"),
         ("approvals-renewals-suspensions", "Monthly counts of approval, renewal and suspension transitions"),
+        ("state-durations", "Time spent in each state (avg/stddev/median/p90 days) by entry month"),
     ];
 
     public static void List()
@@ -38,6 +39,9 @@ static class ReportRunner
                 break;
             case "approvals-renewals-suspensions":
                 await ApprovalsRenewalsSuspensionsAsync(password, fromMonth, toMonth, csv);
+                break;
+            case "state-durations":
+                await StateDurationsAsync(password, fromMonth, toMonth, csv);
                 break;
             default:
                 throw new InvalidOperationException(
@@ -176,6 +180,76 @@ static class ReportRunner
         }
         Write(["month", "approvals", "renewals", "suspensions"],
             rightAlign: [false, true, true, true], rows, csv);
+    }
+
+    // Dwell time per closed interval, bucketed by the month the state was
+    // entered (cohort view). Only closed intervals exist in the fact table,
+    // so young cohorts skew fast; the count column exposes thin buckets.
+    private static async Task StateDurationsAsync(
+            string password, int fromMonth, int toMonth, bool csv)
+    {
+        using var conn = new SqlConnection(DbInit.GetConnStr(DbInit.OlapDbName, password));
+        await conn.OpenAsync();
+
+        using var cmd = conn.CreateCommand();
+        cmd.CommandText = """
+            SELECT f.from_state_entered_time, s.name,
+                   DATEDIFF(minute, f.from_state_entered_time, f.transition_time)
+            FROM fact_permit_transition f
+            JOIN dim_permit_state s ON s.state_key = f.from_state_key
+            WHERE f.from_state_entered_time >= @from
+              AND f.from_state_entered_time < @to
+            """;
+        cmd.Parameters.AddWithValue("@from",
+            new DateTime(fromMonth / 100, fromMonth % 100, 1));
+        cmd.Parameters.AddWithValue("@to",
+            new DateTime(toMonth / 100, toMonth % 100, 1).AddMonths(1));
+
+        // (entry month, state) -> durations in days
+        var buckets = new Dictionary<(int Month, string State), List<double>>();
+        using (var reader = await cmd.ExecuteReaderAsync())
+        {
+            while (await reader.ReadAsync())
+            {
+                var entered = reader.GetDateTime(0);
+                var key = (entered.Year * 100 + entered.Month, reader.GetString(1));
+                if (!buckets.TryGetValue(key, out var durations))
+                {
+                    buckets[key] = durations = [];
+                }
+                durations.Add(reader.GetInt32(2) / (60.0 * 24.0));
+            }
+        }
+
+        var rows = new List<string[]>();
+        foreach (var ((month, state), durations) in
+            buckets.OrderBy(b => b.Key.Month).ThenBy(b => b.Key.State))
+        {
+            durations.Sort();
+            double avg = durations.Average();
+            double stddev = durations.Count < 2 ? 0.0
+                : Math.Sqrt(durations.Sum(d => (d - avg) * (d - avg)) / (durations.Count - 1));
+            rows.Add([
+                $"{month / 100:D4}-{month % 100:D2}",
+                state,
+                durations.Count.ToString(),
+                avg.ToString("F1"),
+                stddev.ToString("F1"),
+                Percentile(durations, 0.50).ToString("F1"),
+                Percentile(durations, 0.90).ToString("F1"),
+            ]);
+        }
+        Write(["month", "state", "count", "avg_days", "stddev_days", "median_days", "p90_days"],
+            rightAlign: [false, false, true, true, true, true, true], rows, csv);
+    }
+
+    // Linear interpolation between the two nearest ranks (PERCENTILE_CONT).
+    private static double Percentile(List<double> sorted, double p)
+    {
+        double rank = p * (sorted.Count - 1);
+        int lower = (int)rank;
+        int upper = Math.Min(lower + 1, sorted.Count - 1);
+        return sorted[lower] + (rank - lower) * (sorted[upper] - sorted[lower]);
     }
 
     private static void Write(string[] headers, bool[] rightAlign, List<string[]> rows, bool csv)
