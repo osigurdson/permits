@@ -10,6 +10,19 @@ namespace Permits;
 /// </summary>
 static class ReportRunner
 {
+    private static readonly (string Name, string Description)[] Reports =
+    [
+        ("permits-issued-report", "Permits issued (Pending -> Active) by type and month"),
+        ("active-vs-expired", "Active permits at month end vs permits expired during the month"),
+        ("approvals-renewals-suspensions", "Monthly counts of approval, renewal and suspension transitions"),
+    ];
+
+    public static void List()
+    {
+        WriteTable(["name", "description"], rightAlign: [false, false],
+            Reports.Select(r => new[] { r.Name, r.Description }).ToList());
+    }
+
     public static async Task RunAsync(string password, string name, string from, string to, bool csv)
     {
         int fromMonth = ParseMonthKey(from);
@@ -23,10 +36,13 @@ static class ReportRunner
             case "active-vs-expired":
                 await ActiveVsExpiredAsync(password, fromMonth, toMonth, csv);
                 break;
+            case "approvals-renewals-suspensions":
+                await ApprovalsRenewalsSuspensionsAsync(password, fromMonth, toMonth, csv);
+                break;
             default:
                 throw new InvalidOperationException(
                     $"Unknown report '{name}'. Available: " +
-                    "permits-issued-report, active-vs-expired.");
+                    string.Join(", ", Reports.Select(r => r.Name)) + ".");
         }
     }
 
@@ -115,6 +131,51 @@ static class ReportRunner
         }
         Write(["month", "active_permits", "expired_permits"],
             rightAlign: [false, true, true], rows, csv);
+    }
+
+    // Pure edge counts: approvals are Pending -> Active, renewals are any
+    // renew back to Active (Active -> Active and the Expired -> Active grace
+    // renewal), suspensions are Active -> Suspended.
+    private static async Task ApprovalsRenewalsSuspensionsAsync(
+            string password, int fromMonth, int toMonth, bool csv)
+    {
+        using var conn = new SqlConnection(DbInit.GetConnStr(DbInit.OlapDbName, password));
+        await conn.OpenAsync();
+
+        using var cmd = conn.CreateCommand();
+        cmd.CommandText = """
+            SELECT d.month_key,
+                   SUM(CASE WHEN fs.name = 'Pending' AND ts.name = 'Active'
+                       THEN 1 ELSE 0 END) AS approvals,
+                   SUM(CASE WHEN fs.name IN ('Active', 'Expired') AND ts.name = 'Active'
+                       THEN 1 ELSE 0 END) AS renewals,
+                   SUM(CASE WHEN fs.name = 'Active' AND ts.name = 'Suspended'
+                       THEN 1 ELSE 0 END) AS suspensions
+            FROM fact_permit_transition f
+            JOIN dim_permit_state fs ON fs.state_key = f.from_state_key
+            JOIN dim_permit_state ts ON ts.state_key = f.to_state_key
+            JOIN dim_date d ON d.date_key = f.date_key
+            WHERE d.month_key BETWEEN @from AND @to
+            GROUP BY d.month_key
+            ORDER BY d.month_key
+            """;
+        cmd.Parameters.AddWithValue("@from", fromMonth);
+        cmd.Parameters.AddWithValue("@to", toMonth);
+
+        var rows = new List<string[]>();
+        using var reader = await cmd.ExecuteReaderAsync();
+        while (await reader.ReadAsync())
+        {
+            int monthKey = reader.GetInt32(0);
+            rows.Add([
+                $"{monthKey / 100:D4}-{monthKey % 100:D2}",
+                reader.GetInt32(1).ToString(),
+                reader.GetInt32(2).ToString(),
+                reader.GetInt32(3).ToString(),
+            ]);
+        }
+        Write(["month", "approvals", "renewals", "suspensions"],
+            rightAlign: [false, true, true, true], rows, csv);
     }
 
     private static void Write(string[] headers, bool[] rightAlign, List<string[]> rows, bool csv)

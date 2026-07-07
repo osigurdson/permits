@@ -115,6 +115,14 @@ static Command CreateOlapCommand()
             parseResult.GetValue(toOpt)!,
             parseResult.GetValue(csvOpt));
     });
+    // permits olap report ls
+    var reportLs = new Command("ls", "List available reports");
+    reportLs.SetAction((parseResult, cancellationToken) =>
+    {
+        ReportRunner.List();
+        return Task.CompletedTask;
+    });
+    report.Subcommands.Add(reportLs);
     olap.Subcommands.Add(report);
 
     return olap;
