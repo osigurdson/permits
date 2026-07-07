@@ -7,6 +7,8 @@ namespace Permits;
 
 class DbInit
 {
+    public const string OltpDbName = "Permits_OLTP";
+
     public static string GetConnStr(string database, string password, int port = 1733)
     {
         return $"Server=localhost,{port};Database={database};" +
@@ -15,10 +17,9 @@ class DbInit
 
     public static async Task CreateOltpDbAsync(string masterPassword)
     {
-        const string dbName = "Permits_OLTP";
-        await CreateDbAsync(dbName, masterPassword);
+        await CreateDbAsync(OltpDbName, masterPassword);
         string sqlText = await ReadResourceAsync("oltp.sql");
-        await RunScriptAsync(dbName, sqlText, masterPassword);
+        await RunScriptAsync(OltpDbName, sqlText, masterPassword);
     }
 
     private static async Task CreateDbAsync(

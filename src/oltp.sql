@@ -26,7 +26,7 @@ GO
 CREATE TABLE permit_activity (
     activity_id INT IDENTITY(1,1) PRIMARY KEY,
     permit_id INT NOT NULL,
-    activity_type_code INT NOT NULL,    -- see ActivityType enum in DataGenerator.cs
+    activity_type_code INT NOT NULL,    -- see ActivityType enum in Simulator.cs
     activity_time DATETIME2 NOT NULL,
 
     CONSTRAINT fk_permit_activity_permit FOREIGN KEY (permit_id)
@@ -43,13 +43,24 @@ GO
 CREATE TABLE permit_person (
     permit_id INT NOT NULL,
     person_id INT NOT NULL,
-    role INT NOT NULL,                  -- see PermitRole enum in DataGenerator.cs
+    role INT NOT NULL,                  -- see PermitRole enum in Simulator.cs
 
     CONSTRAINT pk_permit_person PRIMARY KEY (permit_id, person_id),
     CONSTRAINT fk_permit_person_permit FOREIGN KEY (permit_id)
         REFERENCES permit(permit_id),
     CONSTRAINT fk_permit_person_person FOREIGN KEY (person_id)
         REFERENCES person(person_id)
+);
+GO
+
+-- Single-row simulator bookkeeping: the simulator is deterministic, so
+-- (seed, epoch, event_count) is enough to replay and continue the stream.
+CREATE TABLE sim_state (
+    id INT NOT NULL CONSTRAINT pk_sim_state PRIMARY KEY
+        CONSTRAINT ck_sim_state_singleton CHECK (id = 1),
+    seed INT NOT NULL,
+    epoch DATETIME2 NOT NULL,
+    event_count INT NOT NULL
 );
 GO
 

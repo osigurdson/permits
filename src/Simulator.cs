@@ -60,7 +60,8 @@ class PermitSimulator
     private static readonly string[] PermitTypes =
         ["Building-001", "Electrical-004", "Plumbing-002", "Demolition-007", "Signage-003"];
 
-    private static readonly TimeSpan ValidityPeriod = TimeSpan.FromDays(365);
+    private static readonly TimeSpan ValidityPeriod = TimeSpan.FromDays(60);
+    private static readonly TimeSpan RenewWindow = TimeSpan.FromDays(7);
 
     private readonly Random m_rng;
     private DateTime m_clock;
@@ -73,7 +74,10 @@ class PermitSimulator
     {
         public required int PermitId;
         public required PermitStateMachine Machine;
-        public DateTime? InspectedAt; // final inspection date, drawn at approval
+        public DateTime? InspectedAt;  // final inspection date, drawn at approval
+        public bool LetsLapse;         // holder neglects renewal and the permit expires
+        public bool RenewsInGrace;     // lapsed holder renews during the grace period
+        public DateTime? GraceRenewAt; // scheduled grace renewal, set on expiry
     }
 
     private sealed class PaymentState
@@ -102,13 +106,38 @@ class PermitSimulator
 
     public SimEvent Next()
     {
-        m_clock = m_clock.AddMinutes(m_rng.Next(30, 60 * 36));
+        // 30-180 min per event (avg ~105) puts ~5000 events in about a year.
+        m_clock = m_clock.AddMinutes(m_rng.Next(30, 180));
 
         // Clock-driven lifecycle first, in priority order. Events are stamped at
         // detection time, not backdated, so activity times stay monotonic per
         // permit and replaying the activity log always reproduces current state.
 
-        // 1. Clock transitions owned by the state machine: Active -> Expired once
+        // 1. Proactive renewal: a diligent holder renews shortly before expiry
+        //    whenever the works will outlast the current validity.
+        var renew = m_permits.FirstOrDefault(p =>
+            p.Machine.Current == PermitState.Active && !p.LetsLapse
+            && p.InspectedAt > p.Machine.Expiration
+            && m_clock > p.Machine.Expiration - RenewWindow
+            && m_clock <= p.Machine.Expiration);
+        if (renew != null)
+        {
+            renew.Machine.Update(m_clock, Trigger.Renew);
+            return new PermitRenewed(m_clock, renew.PermitId, renew.Machine.Expiration.DateTime);
+        }
+
+        // 2. Grace-period renewal: a lapsed holder renews back to Active.
+        var grace = m_permits.FirstOrDefault(p =>
+            p.Machine.Current == PermitState.Expired && p.GraceRenewAt < m_clock);
+        if (grace != null)
+        {
+            grace.GraceRenewAt = null;
+            grace.LetsLapse = false; // renewed holders stay diligent afterwards
+            grace.Machine.Update(m_clock, Trigger.Renew);
+            return new PermitRenewed(m_clock, grace.PermitId, grace.Machine.Expiration.DateTime);
+        }
+
+        // 3. Clock transitions owned by the state machine: Active -> Expired once
         //    validity lapses, Expired -> ExpiredTerminal once the grace period ends.
         //    One event per Next(); remaining permits are picked up on later ticks.
         foreach (var permit in m_permits)
@@ -119,18 +148,27 @@ class PermitSimulator
             {
                 continue;
             }
-            // Steps are <= 36h and expiry is checked every step, while the grace
+            // Steps are <= 3h and expiry is checked every step, while the grace
             // period is 30 days, so a permit is always seen Expired before terminal.
-            return permit.Machine.Current switch
+            switch (permit.Machine.Current)
             {
-                PermitState.Expired => new PermitExpired(m_clock, permit.PermitId),
-                PermitState.ExpiredTerminal => new PermitExpiredTerminal(m_clock, permit.PermitId),
-                _ => throw new InvalidOperationException(
-                    $"Unexpected clock transition {previous} -> {permit.Machine.Current}."),
-            };
+                case PermitState.Expired:
+                    // Diligent holders can still lapse (e.g. expiry crossed while
+                    // suspended); they always recover during the grace period.
+                    if (permit.RenewsInGrace || !permit.LetsLapse)
+                    {
+                        permit.GraceRenewAt = m_clock.AddDays(m_rng.Next(1, 25));
+                    }
+                    return new PermitExpired(m_clock, permit.PermitId);
+                case PermitState.ExpiredTerminal:
+                    return new PermitExpiredTerminal(m_clock, permit.PermitId);
+                default:
+                    throw new InvalidOperationException(
+                        $"Unexpected clock transition {previous} -> {permit.Machine.Current}.");
+            }
         }
 
-        // 2. Final inspection due: the passed inspection completes the permit.
+        // 4. Final inspection due: the passed inspection completes the permit.
         var inspect = m_permits.FirstOrDefault(p =>
             p.Machine.Current == PermitState.Active && p.InspectedAt < m_clock);
         if (inspect != null)
@@ -194,7 +232,7 @@ class PermitSimulator
     {
         var candidates = m_permits.Where(p =>
             p.Machine.Current is PermitState.Pending or PermitState.Active
-                or PermitState.Suspended or PermitState.Expired).ToList();
+                or PermitState.Suspended).ToList();
         if (candidates.Count == 0)
         {
             return null;
@@ -214,9 +252,13 @@ class PermitSimulator
                 if (roll < 65)
                 {
                     machine.Update(m_clock, Trigger.Approve);
-                    // Works + final inspection take 2-18 months. Most complete inside
-                    // the 1-year validity; the rest expire unless renewed in time.
+                    // Works + final inspection take 2-18 months, well past the 60-day
+                    // validity, so permits expire unless renewed along the way.
                     permit.InspectedAt = m_clock.AddDays(m_rng.Next(60, 540));
+                    // Holder fate, drawn up front: 15% neglect renewal and expire;
+                    // half of those recover by renewing within the grace period.
+                    permit.LetsLapse = m_rng.Next(100) < 15;
+                    permit.RenewsInGrace = permit.LetsLapse && m_rng.Next(100) < 50;
                     return new PermitApproved(m_clock, permit.PermitId, m_clock,
                         machine.Expiration.DateTime);
                 }
@@ -224,14 +266,9 @@ class PermitSimulator
                 return MakePayment(permit.PermitId);
 
             case PermitState.Active:
-                // Completion and expiry are clock-driven (see Next()); here the
-                // permit holder acts: renew, or the agency suspends.
-                if (roll < 30)
-                {
-                    machine.Update(m_clock, Trigger.Renew);
-                    return new PermitRenewed(m_clock, permit.PermitId, machine.Expiration.DateTime);
-                }
-                if (roll < 42)
+                // Completion, expiry and renewals are clock-driven (see Next());
+                // here the agency acts: suspend, or a fee is paid.
+                if (roll < 12)
                 {
                     machine.Update(m_clock, Trigger.Suspend);
                     return new PermitSuspended(m_clock, permit.PermitId);
@@ -245,16 +282,6 @@ class PermitSimulator
                     return new PermitReinstated(m_clock, permit.PermitId);
                 }
                 return MakePayment(permit.PermitId); // fine paid while suspended
-
-            case PermitState.Expired:
-                // Within the 30-day grace window the holder may renew back to
-                // Active; otherwise the clock eventually makes expiry terminal.
-                if (roll < 40)
-                {
-                    machine.Update(m_clock, Trigger.Renew);
-                    return new PermitRenewed(m_clock, permit.PermitId, machine.Expiration.DateTime);
-                }
-                return null;
 
             default:
                 return null;

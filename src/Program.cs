@@ -2,19 +2,62 @@
 using Permits;
 
 var root = new RootCommand("Permits CLI");
-var oltp = new Command("oltp", "OLTP commands");
-var olap = new Command("olap", "OLAP commands");
-var initOltp = new Command("init", "Create the OLTP database (Permits_OLTP)");
-initOltp.SetAction(async (parseResult, cancellationToken) =>
-{
-    await DbInit.CreateOltpDbAsync(GetSqlPassword());
-});
-oltp.Subcommands.Add(initOltp);
-
-root.Subcommands.Add(oltp);
-root.Subcommands.Add(olap);
-
+root.Subcommands.Add(CreateOltpCommand());
+root.Subcommands.Add(new Command("olap", "OLAP commands"));
 return await root.Parse(args).InvokeAsync();
+
+static Command CreateOltpCommand()
+{
+    var oltp = new Command("oltp", "OLTP commands");
+
+    // permits oltp init 
+    var initOltp = new Command("init", "Create the OLTP database (Permits_OLTP)");
+    initOltp.SetAction(async (parseResult, cancellationToken) =>
+    {
+        await DbInit.CreateOltpDbAsync(GetSqlPassword());
+    });
+    oltp.Subcommands.Add(initOltp);
+
+    var eventCountOpt = new Option<int>("--event-count")
+    {
+        Required = true,
+        Description = "Number of events to simulate",
+    };
+    var epochOpt = new Option<DateTime>("--epoch")
+    {
+        Required = true,
+        Description = "Simulation start time (e.g. 2025-01-01)",
+    };
+    var seedOpt = new Option<int>("--seed")
+    {
+        Required = true,
+        Description = "Random seed for the deterministic event stream",
+    };
+
+    var sim = new Command("sim", "Apply simulated events to the OLTP database");
+    sim.Options.Add(eventCountOpt);
+    sim.SetAction(async (parseResult, cancellationToken) =>
+    {
+        await SimRunner.RunAsync(GetSqlPassword(), parseResult.GetValue(eventCountOpt));
+    });
+
+    var simInit = new Command("init", "Initialize simulation state and apply the first events");
+    simInit.Options.Add(epochOpt);
+    simInit.Options.Add(seedOpt);
+    simInit.Options.Add(eventCountOpt);
+    simInit.SetAction(async (parseResult, cancellationToken) =>
+    {
+        await SimRunner.InitAsync(
+            GetSqlPassword(),
+            parseResult.GetValue(seedOpt),
+            parseResult.GetValue(epochOpt),
+            parseResult.GetValue(eventCountOpt));
+    });
+    sim.Subcommands.Add(simInit);
+    oltp.Subcommands.Add(sim);
+
+    return oltp;
+}
 
 static string GetSqlPassword()
 {
@@ -26,4 +69,3 @@ static string GetSqlPassword()
     }
     return sqlpwd;
 }
-
