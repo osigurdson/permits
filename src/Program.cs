@@ -3,7 +3,7 @@ using Permits;
 
 var root = new RootCommand("Permits CLI");
 root.Subcommands.Add(CreateOltpCommand());
-root.Subcommands.Add(new Command("olap", "OLAP commands"));
+root.Subcommands.Add(CreateOlapCommand());
 return await root.Parse(args).InvokeAsync();
 
 static Command CreateOltpCommand()
@@ -57,6 +57,21 @@ static Command CreateOltpCommand()
     oltp.Subcommands.Add(sim);
 
     return oltp;
+}
+
+static Command CreateOlapCommand()
+{
+    var olap = new Command("olap", "OLAP commands");
+
+    // permits olap init
+    var initOlap = new Command("init", "Create the OLAP database (Permits_DW)");
+    initOlap.SetAction(async (parseResult, cancellationToken) =>
+    {
+        await DbInit.CreateOlapDbAsync(GetSqlPassword());
+    });
+    olap.Subcommands.Add(initOlap);
+
+    return olap;
 }
 
 static string GetSqlPassword()

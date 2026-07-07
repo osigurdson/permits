@@ -13,6 +13,7 @@
   </ItemGroup>
   <ItemGroup>
     <EmbeddedResource Include="oltp.sql" />
+    <EmbeddedResource Include="olap.sql" />
   </ItemGroup>
 
 </Project>
