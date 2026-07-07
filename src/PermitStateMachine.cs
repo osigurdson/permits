@@ -31,6 +31,8 @@ sealed class PermitStateMachine
 
     public PermitState Current { get; private set; }
 
+    public DateTimeOffset Expiration => m_expiration;
+
     private static readonly Dictionary<(PermitState, Trigger), PermitState> s_transitions = new()
     {
         [(PermitState.Initial, Trigger.Apply)] = PermitState.Pending,
@@ -72,12 +74,13 @@ sealed class PermitStateMachine
 
     public void Update(DateTimeOffset now)
     {
+        // At most one edge per call so every transition is observable by callers;
+        // an Active permit past its grace period still passes through Expired.
         if (Current == PermitState.Active && now > m_expiration)
         {
             Current = PermitState.Expired;
         }
-
-        if (Current == PermitState.Expired && now > m_expiration + GracePeriod)
+        else if (Current == PermitState.Expired && now > m_expiration + GracePeriod)
         {
             Current = PermitState.ExpiredTerminal;
         }
