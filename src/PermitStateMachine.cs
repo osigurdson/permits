@@ -2,6 +2,7 @@ namespace Permits;
 
 enum PermitState
 {
+    Initial,
     Pending,
     Rejected,
     Active,
@@ -32,6 +33,8 @@ sealed class PermitStateMachine
 
     private static readonly Dictionary<(PermitState, Trigger), PermitState> s_transitions = new()
     {
+        [(PermitState.Initial, Trigger.Apply)] = PermitState.Pending,
+
         [(PermitState.Pending, Trigger.Reject)] = PermitState.Rejected,
         [(PermitState.Pending, Trigger.Approve)] = PermitState.Active,
 
@@ -59,6 +62,10 @@ sealed class PermitStateMachine
         if (success)
         {
             Current = next;
+            if (trigger == Trigger.Approve || trigger == Trigger.Renew)
+            {
+                m_expiration = now + m_validityPeriod;
+            }
         }
         return success;
     }
